@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<!-- The embedded players check which site they are on, and they read it from
+     the Referer. The browser's default already sends the origin; said here so
+     that a host's own headers cannot quietly make it stricter. -->
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>rzCinema player</title>
+<style>
+/* A black screen that something is projected onto: no margins, no scrollbar,
+   no page behind the picture. Every layer fills the whole browser. */
+html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+#stage { position:absolute; left:0; top:0; width:100%; height:100%; }
+#stage iframe, #stage video, #stage img, #stage div {
+    position:absolute; left:0; top:0; width:100%; height:100%; border:0; background:#000; }
+#stage video, #stage img { object-fit:contain; }
+/* What a sound shows while it plays: its name, low on the screen. */
+#label { position:absolute; left:6%; right:6%; bottom:10%; text-align:center; color:#c9c9c9;
+    font:600 28px/1.35 "Segoe UI", Arial, sans-serif; text-shadow:0 2px 8px #000; display:none; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="label"></div>
+<script>
+/*
+ * rzCinema's player page.
+ *
+ * ONE PAGE, TWO WAYS IN. The game carries a copy of it in its Lua and opens
+ * that copy for files -- a <video>, an <audio>, a picture -- which need no site
+ * behind them. And a server owner publishes this same file on an https site of
+ * their own and names its address in the settings: YouTube's player refuses a
+ * page that cannot say where it is, and a copy built from a string cannot.
+ *
+ * THE GAME DRIVES IT, AND IT ONLY REPORTS. The game calls rzPlayer.cmd({op})
+ * to load, play, pause, seek and set the volume. The page answers through
+ * window.rzcinema.report, a function the game puts on the page once it has
+ * loaded: one JSON string per message -- hello, state, time, error. Nothing the
+ * page says makes the game do anything but update what it shows.
+ *
+ * WRITTEN FOR OLD BROWSERS on purpose: plain ES5, no arrow functions, no
+ * promises of its own. The game's stock browser is Chromium 86, and some
+ * players still run older.
+ *
+ * VERSION is what the game checks on hello. It goes up when the conversation
+ * between the two changes, so a published copy older than the addon says so
+ * in the game's console instead of misbehaving.
+ */
+(function () {
+    "use strict";
+
+    var VERSION = 1;
+
+    var stage = document.getElementById("stage");
+    var label = document.getElementById("label");
+
+    var adapter = null;   // what is playing now
+    var token = 0;        // one per load: an older adapter's reports are dropped
+    var volume = 1;
+    var outbox = [];
+    var seq = 0;
+
+    // -- Talking to the game ------------------------------------------------
+    function bridge() {
+        var b = window.rzcinema;
+        return b && typeof b.report === "function" ? b : null;
+    }
+
+    // Queued until the game has put its function on the page, then sent in
+    // order. A handful at most: the latest state is what matters.
+    function report(message) {
+        var line;
+        try { line = JSON.stringify(message); } catch (e) { return; }
+        var b = bridge();
+        if (!b) {
+            outbox.push(line);
+            if (outbox.length > 16) { outbox.shift(); }
+            return;
+        }
+        while (outbox.length) { b.report(outbox.shift()); }
+        b.report(line);
+    }
+
+    function finite(n) { return typeof n === "number" && isFinite(n) ? n : null; }
+
+    // What this browser can decode. H.264 is the one that decides most sites.
+    function codecs() {
+        var v = document.createElement("video");
+        var can = function (type) { try { return v.canPlayType(type); } catch (e) { return ""; } };
+        return {
+            h264: can('video/mp4; codecs="avc1.42E01E, mp4a.40.2"') === "probably",
+            hls: can("application/vnd.apple.mpegurl") !== "",
+            mse: typeof window.MediaSource === "function" || typeof window.MediaSource === "object"
+        };
+    }
+
+    // -- Loading other people's scripts -------------------------------------
+    var scripts = {};
+
+    function loadScript(src, done) {
+        var entry = scripts[src];
+        if (entry && entry.state === "ok") { done(true); return; }
+        if (entry && entry.state === "failed") { done(false); return; }
+        if (entry) { entry.waiting.push(done); return; }
+
+        entry = { state: "loading", waiting: [done] };
+        scripts[src] = entry;
+
+        var finish = function (ok) {
+            if (entry.state !== "loading") { return; }
+            entry.state = ok ? "ok" : "failed";
+            var list = entry.waiting;
+            entry.waiting = [];
+            for (var i = 0; i < list.length; i++) { list[i](ok); }
+        };
+
+        var el = document.createElement("script");
+        el.src = src;
+        el.async = true;
+        el.onload = function () { finish(true); };
+        el.onerror = function () { finish(false); };
+        document.head.appendChild(el);
+        setTimeout(function () { finish(false); }, 15000);
+    }
+
+    // YouTube's API announces itself through a global callback, not onload.
+    var ytWaiting = [];
+    function whenYouTube(done) {
+        if (window.YT && window.YT.Player) { done(true); return; }
+        ytWaiting.push(done);
+        if (ytWaiting.length > 1) { return; }
+
+        var previous = window.onYouTubeIframeAPIReady;
+        var settle = function (ok) {
+            var list = ytWaiting;
+            ytWaiting = [];
+            for (var i = 0; i < list.length; i++) { list[i](ok); }
+        };
+        window.onYouTubeIframeAPIReady = function () {
+            if (typeof previous === "function") { previous(); }
+            settle(true);
+        };
+        loadScript("https://www.youtube.com/iframe_api", function (ok) { if (!ok) { settle(false); } });
+        setTimeout(function () { if (ytWaiting.length) { settle(!!(window.YT && window.YT.Player)); } }, 15000);
+    }
+
+    function element(tag) {
+        var el = document.createElement(tag);
+        el.id = "m" + (++seq);
+        stage.appendChild(el);
+        return el;
+    }
+
+    // -- The adapters -------------------------------------------------------
+    // Each is function(spec, api) returning { play, pause, seek, volume, time,
+    // duration, destroy }. `api` reports for it: api.state(phase, live),
+    // api.error(code, detail). Times are in seconds.
+    var ADAPTERS = {};
+
+    ADAPTERS.youtube = function (spec, api) {
+        var holder = element("div");
+        var player = null;
+        var gone = false;
+        var p = spec.params || {};
+
+        whenYouTube(function (ok) {
+            if (gone) { return; }
+            if (!ok) { api.error("network", "YouTube's player script did not load"); return; }
+
+            var vars = { autoplay: 1, controls: 0, disablekb: 1, fs: 0, rel: 0, iv_load_policy: 3,
+                playsinline: 1, enablejsapi: 1, start: Math.floor(spec.start || 0) };
+            // Only a real site has an origin to give, and only then does
+            // YouTube want it.
+            if (location.protocol === "https:") { vars.origin = location.origin; }
+
+            player = new window.YT.Player(holder.id, {
+                host: "https://www.youtube-nocookie.com",
+                videoId: String(p.id || ""),
+                width: "100%",
+                height: "100%",
+                playerVars: vars,
+                events: {
+                    onReady: function () {
+                        player.setVolume(Math.round(volume * 100));
+                        if (volume <= 0) { player.mute(); } else { player.unMute(); }
+                        api.state("ready", p.live === true);
+                        if (spec.autoplay !== false) { player.playVideo(); }
+                    },
+                    onStateChange: function (e) {
+                        var s = e.data;
+                        if (s === 1) { api.state("playing"); }
+                        else if (s === 2) { api.state("paused"); }
+                        else if (s === 3) { api.state("buffering"); }
+                        else if (s === 0) { api.state("ended"); }
+                    },
+                    onError: function (e) {
+                        var c = e.data;
+                        // 100 gone or private; 101 and 150 embedding refused;
+                        // 153 no referrer -- this page opened without a site.
+                        if (c === 100 || c === 2) { api.error("gone", "youtube " + c); }
+                        else if (c === 101 || c === 150 || c === 152 || c === 153) { api.error("blocked", "youtube " + c); }
+                        else if (c === 5) { api.error("format", "youtube " + c); }
+                        else { api.error("unknown", "youtube " + c); }
+                    }
+                }
+            });
+        });
+
+        var call = function (name, a, b) {
+            if (player && typeof player[name] === "function") { return player[name](a, b); }
+            return null;
+        };
+
+        return {
+            play: function () { call("playVideo"); },
+            pause: function () { call("pauseVideo"); },
+            seek: function (t) { call("seekTo", t, true); },
+            volume: function (v) {
+                call("setVolume", Math.round(v * 100));
+                if (v <= 0) { call("mute"); } else { call("unMute"); }
+            },
+            time: function () { return finite(call("getCurrentTime")); },
+            duration: function () { return finite(call("getDuration")); },
+            destroy: function () { gone = true; try { if (player) { player.destroy(); } } catch (e) {} }
+        };
+    };
+
+    ADAPTERS.vimeo = function (spec, api) {
+        var holder = element("div");
+        var player = null;
+        var gone = false;
+        var now = 0, total = null;
+        var p = spec.params || {};
+
+        loadScript("https://player.vimeo.com/api/player.js", function (ok) {
+            if (gone) { return; }
+            if (!ok || !window.Vimeo) { api.error("network", "Vimeo's player script did not load"); return; }
+
+            var options = { autoplay: true, controls: false, dnt: true, muted: volume <= 0, title: false,
+                byline: false, portrait: false, width: 1920 };
+            if (p.hash) { options.url = "https://vimeo.com/" + p.id + "/" + p.hash; } else { options.id = Number(p.id); }
+
+            player = new window.Vimeo.Player(holder, options);
+            var quiet = function () {};
+            player.on("loaded", function () {
+                player.setVolume(volume)["catch"](quiet);
+                if (spec.start > 0) { player.setCurrentTime(spec.start)["catch"](quiet); }
+                api.state("ready");
+            });
+            player.on("play", function () { api.state("playing"); });
+            player.on("playing", function () { api.state("playing"); });
+            player.on("pause", function () { api.state("paused"); });
+            player.on("bufferstart", function () { api.state("buffering"); });
+            player.on("bufferend", function () { api.state("playing"); });
+            player.on("ended", function () { api.state("ended"); });
+            player.on("timeupdate", function (d) { now = d.seconds; total = d.duration; });
+            player.on("error", function (e) {
+                var name = e && e.name ? String(e.name) : "";
+                api.error(name === "PrivacyError" || name === "PasswordError" ? "blocked" : "unknown",
+                    "vimeo " + name);
+            });
+            player.ready()["catch"](function (e) { api.error("gone", "vimeo " + (e && e.name ? e.name : "")); });
+        });
+
+        var call = function (name, a) {
+            if (player) { try { player[name](a)["catch"](function () {}); } catch (e) {} }
+        };
+
+        return {
+            play: function () { call("play"); },
+            pause: function () { call("pause"); },
+            seek: function (t) { call("setCurrentTime", t); },
+            volume: function (v) { call("setVolume", v); },
+            time: function () { return finite(now); },
+            duration: function () { return finite(total); },
+            destroy: function () { gone = true; try { if (player) { player.destroy(); } } catch (e) {} }
+        };
+    };
+
+    ADAPTERS.soundcloud = function (spec, api) {
+        var p = spec.params || {};
+        var frame = element("iframe");
+        frame.allow = "autoplay";
+        frame.src = "https://w.soundcloud.com/player/?url=" + encodeURIComponent(String(p.url || ""))
+            + "&auto_play=" + (spec.autoplay === false ? "false" : "true")
+            + "&visual=true&show_comments=false&hide_related=true&show_reposts=false&show_teaser=false";
+
+        var widget = null;
+        var gone = false;
+        var now = 0, total = null;
+
+        loadScript("https://w.soundcloud.com/player/api.js", function (ok) {
+            if (gone) { return; }
+            if (!ok || !window.SC || !window.SC.Widget) { api.error("network", "SoundCloud's widget script did not load"); return; }
+
+            widget = window.SC.Widget(frame);
+            var E = window.SC.Widget.Events;
+            widget.bind(E.READY, function () {
+                widget.setVolume(Math.round(volume * 100));
+                widget.getDuration(function (ms) { total = ms / 1000; });
+                if (spec.start > 0) { widget.seekTo(spec.start * 1000); }
+                api.state("ready");
+            });
+            widget.bind(E.PLAY, function () { api.state("playing"); });
+            widget.bind(E.PAUSE, function () { api.state("paused"); });
+            widget.bind(E.FINISH, function () { api.state("ended"); });
+            widget.bind(E.PLAY_PROGRESS, function (d) { if (d) { now = d.currentPosition / 1000; } });
+            widget.bind(E.ERROR, function () { api.error("gone", "soundcloud"); });
+        });
+
+        return {
+            play: function () { if (widget) { widget.play(); } },
+            pause: function () { if (widget) { widget.pause(); } },
+            seek: function (t) { if (widget) { widget.seekTo(t * 1000); } },
+            volume: function (v) { if (widget) { widget.setVolume(Math.round(v * 100)); } },
+            time: function () { return finite(now); },
+            duration: function () { return finite(total); },
+            destroy: function () { gone = true; }
+        };
+    };
+
+    ADAPTERS.mixcloud = function (spec, api) {
+        var p = spec.params || {};
+        var frame = element("iframe");
+        frame.allow = "autoplay";
+        frame.src = "https://player-widget.mixcloud.com/widget/iframe/?feed=" + encodeURIComponent(String(p.key || ""))
+            + "&hide_cover=1&autoplay=" + (spec.autoplay === false ? "0" : "1");
+
+        var widget = null;
+        var gone = false;
+        var now = 0, total = null;
+
+        loadScript("https://widget.mixcloud.com/media/js/widgetApi.js", function (ok) {
+            if (gone) { return; }
+            if (!ok || !window.Mixcloud) { api.error("network", "Mixcloud's widget script did not load"); return; }
+
+            widget = window.Mixcloud.PlayerWidget(frame);
+            widget.ready.then(function () {
+                var ev = widget.events;
+                ev.progress.on(function (position, length) { now = position; total = length; });
+                ev.play.on(function () { api.state("playing"); });
+                ev.pause.on(function () { api.state("paused"); });
+                ev.buffering.on(function () { api.state("buffering"); });
+                ev.ended.on(function () { api.state("ended"); });
+                ev.error.on(function () { api.error("gone", "mixcloud"); });
+                // No volume control in Mixcloud's API: it plays at its own.
+                if (spec.start > 0) { widget.seek(spec.start); }
+                api.state("ready");
+            });
+        });
+
+        return {
+            play: function () { if (widget) { widget.play(); } },
+            pause: function () { if (widget) { widget.pause(); } },
+            seek: function (t) { if (widget) { widget.seek(t); } },
+            volume: function () {},
+            time: function () { return finite(now); },
+            duration: function () { return finite(total); },
+            destroy: function () { gone = true; }
+        };
+    };
+
+    // A file, played by the browser itself. The first source this browser can
+    // decode wins; a stream (HLS, DASH) goes through hls.js or dash.js unless
+    // the browser plays it natively.
+    var HLS = "https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js";
+    var DASH = "https://cdn.jsdelivr.net/npm/dashjs@4.7.4/dist/dash.all.min.js";
+
+    function mediaAdapter(tag) {
+        return function (spec, api) {
+            var el = element(tag);
+            var p = spec.params || {};
+            var sources = p.sources || [];
+            var extra = null;
+            var gone = false;
+            var started = false;
+
+            el.autoplay = spec.autoplay !== false;
+            el.playsInline = true;
+            el.preload = "auto";
+            el.volume = Math.max(0, Math.min(1, volume));
+            el.muted = volume <= 0;
+
+            el.addEventListener("loadedmetadata", function () {
+                if (!started && spec.start > 0 && isFinite(el.duration)) { try { el.currentTime = spec.start; } catch (e) {} }
+                started = true;
+                api.state("ready", !isFinite(el.duration));
+            });
+            el.addEventListener("playing", function () { api.state("playing"); });
+            el.addEventListener("pause", function () { if (!el.ended) { api.state("paused"); } });
+            el.addEventListener("waiting", function () { api.state("buffering"); });
+            el.addEventListener("ended", function () { api.state("ended"); });
+            el.addEventListener("error", function () {
+                var err = el.error ? el.error.code : 0;
+                // 2 the network, 3 decoding, 4 nothing here this browser can play.
+                if (err === 2) { api.error("network", "media error 2"); }
+                else if (err === 4 || err === 3) { api.error(chosenH264 ? "codec" : "format", "media error " + err); }
+                else { api.error("unknown", "media error " + err); }
+            });
+
+            var have = codecs();
+            var chosen = null, chosenH264 = false;
+            for (var i = 0; i < sources.length && !chosen; i++) {
+                var s = sources[i] || {};
+                var type = String(s.type || "");
+                if (type === "application/x-mpegurl" || type === "application/dash+xml") {
+                    chosen = s;
+                } else {
+                    var can = "";
+                    try { can = el.canPlayType(type); } catch (e) {}
+                    if (can !== "") { chosen = s; }
+                }
+            }
+
+            if (!chosen && sources.length) {
+                // Nothing this browser can decode. Almost always H.264 on the
+                // stock browser, which is worth naming.
+                var mp4 = String(sources[0].type || "").indexOf("mp4") >= 0 || String(sources[0].type || "") === "video/quicktime";
+                setTimeout(function () { api.error(mp4 && !have.h264 ? "codec" : "format", "no playable source"); }, 0);
+            } else if (chosen) {
+                var type2 = String(chosen.type || "");
+                chosenH264 = !have.h264 && (type2.indexOf("mp4") >= 0 || type2 === "video/quicktime" || type2 === "application/x-mpegurl");
+
+                if (type2 === "application/x-mpegurl" && !have.hls) {
+                    loadScript(HLS, function (ok) {
+                        if (gone) { return; }
+                        if (!ok || !window.Hls || !window.Hls.isSupported()) { api.error(have.h264 ? "format" : "codec", "hls.js"); return; }
+                        var hls = new window.Hls({ startPosition: spec.start > 0 ? spec.start : -1 });
+                        extra = { destroy: function () { hls.destroy(); } };
+                        hls.on(window.Hls.Events.ERROR, function (_, data) {
+                            if (data && data.fatal) {
+                                api.error(data.type === "networkError" ? "network" : (have.h264 ? "format" : "codec"),
+                                    "hls " + data.details);
+                            }
+                        });
+                        hls.loadSource(String(chosen.url));
+                        hls.attachMedia(el);
+                    });
+                } else if (type2 === "application/dash+xml") {
+                    loadScript(DASH, function (ok) {
+                        if (gone) { return; }
+                        if (!ok || !window.dashjs) { api.error("network", "dash.js"); return; }
+                        var dash = window.dashjs.MediaPlayer().create();
+                        extra = { destroy: function () { dash.reset(); } };
+                        dash.initialize(el, String(chosen.url), spec.autoplay !== false);
+                    });
+                } else {
+                    el.src = String(chosen.url);
+                }
+            }
+
+            return {
+                play: function () { var r = el.play(); if (r && r["catch"]) { r["catch"](function () {}); } },
+                pause: function () { el.pause(); },
+                seek: function (t) { try { el.currentTime = t; } catch (e) {} },
+                volume: function (v) { el.volume = Math.max(0, Math.min(1, v)); el.muted = v <= 0; },
+                time: function () { return finite(el.currentTime); },
+                duration: function () { return finite(el.duration); },
+                destroy: function () {
+                    gone = true;
+                    try { if (extra) { extra.destroy(); } } catch (e) {}
+                    try { el.pause(); el.removeAttribute("src"); el.load(); } catch (e2) {}
+                }
+            };
+        };
+    }
+
+    ADAPTERS.video = mediaAdapter("video");
+    ADAPTERS.audio = mediaAdapter("audio");
+
+    ADAPTERS.image = function (spec, api) {
+        var el = element("img");
+        el.onload = function () { api.state("playing", true); };
+        el.onerror = function () { api.error("network", "the picture did not load"); };
+        el.src = String((spec.params || {}).url || "");
+        return {
+            play: function () {}, pause: function () {}, seek: function () {}, volume: function () {},
+            time: function () { return null; }, duration: function () { return null; },
+            destroy: function () {}
+        };
+    };
+
+    // -- Running one --------------------------------------------------------
+    var lastPhase = "idle";
+
+    function stop() {
+        token++;
+        if (adapter) { try { adapter.destroy(); } catch (e) {} }
+        adapter = null;
+        stage.innerHTML = "";
+        label.style.display = "none";
+        lastPhase = "idle";
+    }
+
+    function load(c) {
+        stop();
+        var make = ADAPTERS[c.adapter];
+        if (!make) { report({ ev: "error", code: "unknown", detail: "no adapter " + String(c.adapter) }); return; }
+
+        var mine = token;
+        var live = false;
+        if (typeof c.volume === "number") { volume = Math.max(0, Math.min(1, c.volume)); }
+
+        var api = {
+            state: function (phase, isLive) {
+                if (mine !== token) { return; }
+                if (isLive === true) { live = true; }
+                lastPhase = phase;
+                report({ ev: "state", phase: phase, t: adapter ? adapter.time() : null,
+                    d: adapter && !live ? adapter.duration() : null, live: live });
+            },
+            error: function (code, detail) {
+                if (mine !== token) { return; }
+                lastPhase = "error";
+                report({ ev: "error", code: String(code), detail: String(detail || "").slice(0, 200) });
+            }
+        };
+
+        if (c.adapter === "audio" && c.label) {
+            label.textContent = String(c.label).slice(0, 160);
+            label.style.display = "block";
+        }
+
+        try {
+            adapter = make({ params: c.params || {}, start: Math.max(0, Number(c.start) || 0),
+                autoplay: c.autoplay !== false }, api);
+        } catch (e) {
+            api.error("unknown", "adapter: " + e);
+            return;
+        }
+        report({ ev: "state", phase: "loading", t: 0, d: null, live: false });
+    }
+
+    // Once a second while something plays: where it is. Only the game decides
+    // what to do about it.
+    setInterval(function () {
+        if (!adapter || lastPhase !== "playing") { return; }
+        report({ ev: "time", t: adapter.time(), d: adapter.duration() });
+    }, 1000);
+
+    window.rzPlayer = {
+        version: VERSION,
+        hello: function () {
+            var c = codecs();
+            report({ ev: "hello", v: VERSION, h264: c.h264, hls: c.hls, mse: c.mse,
+                ua: String(navigator.userAgent || "").slice(0, 160) });
+        },
+        cmd: function (c) {
+            if (!c || typeof c !== "object") { return; }
+            if (c.op === "load") { load(c); return; }
+            if (c.op === "stop") { stop(); return; }
+            if (!adapter) { return; }
+            try {
+                if (c.op === "play") { adapter.play(); }
+                else if (c.op === "pause") { adapter.pause(); }
+                else if (c.op === "seek") { adapter.seek(Math.max(0, Number(c.t) || 0)); }
+                else if (c.op === "volume") {
+                    volume = Math.max(0, Math.min(1, Number(c.v) || 0));
+                    adapter.volume(volume);
+                }
+            } catch (e) {
+                report({ ev: "error", code: "unknown", detail: String(c.op) + ": " + e });
+            }
+        }
+    };
+})();
+</script>
+</body>
+</html>
