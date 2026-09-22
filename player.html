@@ -33,6 +33,14 @@ html, body { margin:0; padding:0; width:100%; height:100%; background:#000; over
  * their own and names its address in the settings: YouTube's player refuses a
  * page that cannot say where it is, and a copy built from a string cannot.
  *
+ * AND A THIRD THING IT DOES, BEFORE ANY OF THAT: it sends the browser on. The
+ * game opens the published copy with "#go=" and the address of a site's own
+ * player, and the page goes there at once -- so the site is reached from a
+ * real https site, which is what YouTube asks for, while its player is the
+ * whole browser, where the game's controller can reach into it. Only to the
+ * players on the list below: this page is public, and one that goes wherever
+ * it is told is a link anybody could use to dress a trap in the owner's name.
+ *
  * THE GAME DRIVES IT, AND IT ONLY REPORTS. The game calls rzPlayer.cmd({op})
  * to load, play, pause, seek and set the volume. The page answers through
  * window.rzcinema.report, a function the game puts on the page once it has
@@ -50,7 +58,33 @@ html, body { margin:0; padding:0; width:100%; height:100%; background:#000; over
 (function () {
     "use strict";
 
-    var VERSION = 1;
+    var VERSION = 2;
+
+    // -- Sent on ------------------------------------------------------------
+    // The players this page may send a browser to, whole address and all.
+    var HOPS = [/^https:\/\/www\.youtube(-nocookie)?\.com\/embed\/[\w-]{11}(\?[\w=&%.-]*)?$/];
+
+    // Where "#go=..." says to go, or null: null for a hash that is not one of
+    // ours, for one that is not an address at all, and for an address no rule
+    // above allows.
+    function hopTarget(hash) {
+        var text = String(hash || "");
+        if (text.indexOf("#go=") !== 0) { return null; }
+
+        var url;
+        try { url = decodeURIComponent(text.slice(4)); } catch (e) { return null; }
+        for (var i = 0; i < HOPS.length; i++) {
+            if (HOPS[i].test(url)) { return url; }
+        }
+        return null;
+    }
+
+    var going = hopTarget(location.hash);
+    if (going) {
+        // replace, not assign: the browser is not to come back here.
+        location.replace(going);
+        return;
+    }
 
     var stage = document.getElementById("stage");
     var label = document.getElementById("label");
@@ -541,6 +575,7 @@ html, body { margin:0; padding:0; width:100%; height:100%; background:#000; over
 
     window.rzPlayer = {
         version: VERSION,
+        hopTarget: hopTarget,
         hello: function () {
             var c = codecs();
             report({ ev: "hello", v: VERSION, h264: c.h264, hls: c.hls, mse: c.mse,
