@@ -304,7 +304,11 @@ html, body { margin:0; padding:0; width:100%; height:100%; background:#000; over
         return {
             play: function () { call("play"); },
             pause: function () { call("pause"); },
-            seek: function (t) { call("setCurrentTime", t); },
+            // Where it was asked to go, said at once: a widget tells us where
+            // it is a few times a second, and until the next time it says so
+            // its last word is the place before the jump -- which the game
+            // would take for the truth and draw the cursor back to.
+            seek: function (t) { now = t; call("setCurrentTime", t); },
             volume: function (v) { call("setVolume", v); },
             time: function () { return finite(now); },
             duration: function () { return finite(total); },
@@ -346,7 +350,7 @@ html, body { margin:0; padding:0; width:100%; height:100%; background:#000; over
         return {
             play: function () { if (widget) { widget.play(); } },
             pause: function () { if (widget) { widget.pause(); } },
-            seek: function (t) { if (widget) { widget.seekTo(t * 1000); } },
+            seek: function (t) { now = t; if (widget) { widget.seekTo(t * 1000); } },
             volume: function (v) { if (widget) { widget.setVolume(Math.round(v * 100)); } },
             time: function () { return finite(now); },
             duration: function () { return finite(total); },
@@ -387,7 +391,7 @@ html, body { margin:0; padding:0; width:100%; height:100%; background:#000; over
         return {
             play: function () { if (widget) { widget.play(); } },
             pause: function () { if (widget) { widget.pause(); } },
-            seek: function (t) { if (widget) { widget.seek(t); } },
+            seek: function (t) { now = t; if (widget) { widget.seek(t); } },
             volume: function () {},
             time: function () { return finite(now); },
             duration: function () { return finite(total); },
